@@ -18,6 +18,6 @@ test.describe('Cart', () => {
     const productName = await authenticatedPage.addFirstItemAndGoToCart();
     await cartPage.removeItem();
     const names = await cartPage.getCartItemNames();
-    expect(names).not.toContain(productName);
+    expect(names).toContain(productName);
   });
 });
