@@ -8,6 +8,7 @@ test.describe('Cart', () => {
     expect(count).toBe(0);
   });
 
+  // add new comment to check pr actions
   test('should add one item to cart and show it in cart', async ({ authenticatedPage, cartPage }) => {
     const productName = await authenticatedPage.addFirstItemAndGoToCart();
     const names = await cartPage.getCartItemNames();
