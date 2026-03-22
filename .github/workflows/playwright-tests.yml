@@ -19,6 +19,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy-pages.outputs.page_url }}
+
     env:
       CI: true
 
@@ -85,3 +94,110 @@ jobs:
               }
             ]
           }' "${{ secrets.TEAMS_WEBHOOK_URL }}"
+
+      # Fetch existing history.json from gh-pages branch (if present) and append a new record
+      - name: Prepare history.json
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          HISTORY_FILE="playwright-report/history.json"
+          TEMP_DIR=$(mktemp -d)
+
+          # Try to fetch existing history from gh-pages
+          git fetch origin gh-pages 2>/dev/null && \
+            git --work-tree="$TEMP_DIR" checkout origin/gh-pages -- history.json 2>/dev/null && \
+            cp "$TEMP_DIR/history.json" "$HISTORY_FILE" || true
+
+          # Build new entry
+          NEW_ENTRY=$(jq -n \
+            --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg ref "${{ github.ref }}" \
+            --arg conclusion "${{ job.status }}" \
+            '{
+              timestamp: $timestamp,
+              runUrl: $runUrl,
+              sha: $sha,
+              ref: $ref,
+              conclusion: $conclusion
+            }')
+
+          # Merge into existing array or create a new one
+          if [ -f "$HISTORY_FILE" ]; then
+            jq --argjson entry "$NEW_ENTRY" '. + [$entry]' "$HISTORY_FILE" > tmp_history.json && mv tmp_history.json "$HISTORY_FILE"
+          else
+            echo "[$NEW_ENTRY]" | jq '.' > "$HISTORY_FILE"
+          fi
+
+      # Upload the playwright-report directory as the GitHub Pages artifact
+      - name: Upload Pages artifact
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: playwright-report/
+
+      # Deploy the uploaded artifact to GitHub Pages
+      - name: Deploy to GitHub Pages
+        id: deploy-pages
+        if: always() && github.ref == 'refs/heads/main'
+        uses: actions/deploy-pages@v4
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    continue-on-error: false
+
+    steps:
+      # Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up Node.js LTS with Yarn cache
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      # Install dependencies using the frozen lockfile
+      - name: Install dependencies
+        run: yarn install --immutable --immutable-cache --check-cache
+
+      # Run yarn audit and fail on high or critical vulnerabilities
+      - name: Run dependency vulnerability scan
+        id: yarn-audit
+        run: |
+          set +e
+          yarn audit --level high --json > audit-output.json 2>&1
+          EXIT_CODE=$?
+          set -e
+
+          echo "## 🔒 Dependency Vulnerability Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          HIGH=$(grep '"type":"auditAdvisory"' audit-output.json | python3 -c "
+          import sys, json
+          count = 0
+          for line in sys.stdin:
+              line = line.strip()
+              if line:
+                  try:
+                      obj = json.loads(line)
+                      sev = obj.get('data', {}).get('advisory', {}).get('severity', '')
+                      if sev in ('high', 'critical'):
+                          count += 1
+                  except Exception:
+                      pass
+          print(count)
+          " 2>/dev/null || echo "0")
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| High / Critical | ${HIGH} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **High or critical vulnerabilities detected. Blocking PR.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "✅ **No high or critical vulnerabilities found.**" >> $GITHUB_STEP_SUMMARY
+          fi
